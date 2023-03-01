@@ -7,6 +7,8 @@
 #define MAIN_SOCKET  "d30138f2310a9fb9c54a3e0c21f58591\0"
 #define JAVA_PACKAGE_NAME "com.topjohnwu.magisk"
 #define LOGFILE         "/cache/magisk.log"
+#define ZYGISKLDR       "libzygisk_loader.so"
+#define NBPROP          "ro.dalvik.vm.native.bridge"
 #define SECURE_DIR      "/data/adb"
 #define MODULEROOT      SECURE_DIR "/modules"
 #define MODULEUPGRADE   SECURE_DIR "/modules_update"
@@ -41,5 +43,4 @@ extern int SDK_INT;
 int magisk_main(int argc, char *argv[]);
 int su_client_main(int argc, char *argv[]);
 int resetprop_main(int argc, char *argv[]);
-int app_process_main(int argc, char *argv[]);
 int zygisk_main(int argc, char *argv[]);
