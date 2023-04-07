@@ -21,6 +21,7 @@ struct api_abi_v1;
 struct api_abi_v2;
 using  api_abi_v3 = api_abi_v2;
 struct api_abi_v4;
+struct api_abi_v5;
 
 union ApiTable;
 
@@ -148,11 +149,17 @@ struct api_abi_v4 : public api_abi_base {
     /* 7 */ uint32_t (*getFlags)(ZygiskModule *);
 };
 
+struct api_abi_v5 : public api_abi_v4 {
+    /* 8 */ const char *(*getRootSolution)();
+    /* 9 */ void *(*getExtension)(int extApiLevel);
+};
+
 union ApiTable {
     api_abi_base base;
     api_abi_v1 v1;
     api_abi_v2 v2;
     api_abi_v4 v4;
+    api_abi_v5 v5;
 };
 
 #define call_app(method)               \

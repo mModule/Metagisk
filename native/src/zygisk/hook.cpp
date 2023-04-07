@@ -292,6 +292,10 @@ bool ZygiskModule::RegisterModuleImpl(ApiTable *api, long *module) {
         };
         api->v4.exemptFd = [](int fd) { return g_ctx && g_ctx->exempt_fd(fd); };
     }
+    if (api_version >= 5) {
+        api->v5.getRootSolution = []() { return "Magisk"; };
+        api->v5.getExtension = [](auto) -> void * { return nullptr; };
+    };
 
     return true;
 }

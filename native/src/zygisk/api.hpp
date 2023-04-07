@@ -23,7 +23,7 @@
 
 #include <jni.h>
 
-#define ZYGISK_API_VERSION 4
+#define ZYGISK_API_VERSION 5
 
 /*
 
@@ -280,6 +280,12 @@ struct Api {
     // Returns false if an error occurred.
     bool pltHookCommit();
 
+    // Get the root solution name that is currently in use, e.g., Magisk or KernelSU.
+    const char *getRootSolution();
+
+    // Get the extension object provided by current root solution, or nullptr if not available.
+    void *getExtension(int extApiLevel);
+
 private:
     internal::api_table *tbl;
     template <class T> friend void internal::entry_impl(internal::api_table *, JNIEnv *);
@@ -342,6 +348,8 @@ struct api_table {
     void (*setOption)(void * /* impl */, Option);
     int  (*getModuleDir)(void * /* impl */);
     uint32_t (*getFlags)(void * /* impl */);
+    const char *(*getRootSolution)();
+    void *(*getExtension)(int);
 };
 
 template <class T>
@@ -380,6 +388,14 @@ inline void Api::pltHookRegister(dev_t dev, ino_t inode, const char *symbol, voi
 }
 inline bool Api::pltHookCommit() {
     return tbl->pltHookCommit != nullptr && tbl->pltHookCommit();
+}
+
+inline const char *Api::getRootSolution() {
+    return tbl->getRootSolution ? tbl->getRootSolution() : nullptr;
+}
+
+inline void *Api::getExtension(int extApiLevel) {
+    return tbl->getExtension ? tbl->getExtension(extApiLevel) : nullptr;
 }
 
 } // namespace zygisk
