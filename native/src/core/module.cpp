@@ -15,15 +15,35 @@ using namespace std;
 
 #define VLOGD(tag, from, to) LOGD("%-8s: %s <- %s\n", tag, to, from)
 
-static int bind_mount(const char *reason, const char *from, const char *to) {
+namespace {
+int bind_mount(const char *reason, const char *from, const char *to) {
     int ret = xmount(from, to, nullptr, MS_BIND | MS_REC, nullptr);
     if (ret == 0)
         VLOGD(reason, from, to);
     return ret;
 }
 
-string node_entry::module_mnt;
-string node_entry::mirror_dir;
+void inject_magisk_bins(root_node *system) {
+    auto bin = system->get_child<inter_node>("bin");
+    if (!bin) {
+        bin = new inter_node("bin");
+        system->insert(bin);
+    }
+
+    // Insert binaries
+    bin->insert(new magisk_node("magisk"));
+    if (access("/system/bin/linker", F_OK) == 0)
+        bin->insert(new magisk_node("magisk32"));
+    if (access("/system/bin/linker64", F_OK) == 0)
+        bin->insert(new magisk_node("magisk64"));
+    bin->insert(new magisk_node("magiskpolicy"));
+
+    // Also delete all applets to make sure no modules can override it
+    for (int i = 0; applet_names[i]; ++i)
+        delete bin->extract(applet_names[i]);
+    delete bin->extract("supolicy");
+}
+} // namespace
 
 /*************************
  * Node Tree Construction
@@ -183,46 +203,24 @@ void tmpfs_node::mount() {
  * Magisk Stuffs
  ****************/
 
-class magisk_node : public node_entry {
-public:
-    explicit magisk_node(const char *name) : node_entry(name, DT_REG, this) {}
+void magisk_node::mount() {
+    const string src = MAGISKTMP + "/" + name();
+    if (access(src.data(), F_OK))
+        return;
 
-    void mount() override {
-        const string src = MAGISKTMP + "/" + name();
-        if (access(src.data(), F_OK))
-            return;
-
-        const string &dir_name = parent()->node_path();
-        if (name() == "magisk") {
-            for (int i = 0; applet_names[i]; ++i) {
-                string dest = dir_name + "/" + applet_names[i];
-                VLOGD("create", "./magisk", dest.data());
-                xsymlink("./magisk", dest.data());
-            }
-        } else {
-            string dest = dir_name + "/supolicy";
-            VLOGD("create", "./magiskpolicy", dest.data());
-            xsymlink("./magiskpolicy", dest.data());
+    const string &dir_name = parent()->node_path();
+    if (name() == "magisk") {
+        for (int i = 0; applet_names[i]; ++i) {
+            string dest = dir_name + "/" + applet_names[i];
+            VLOGD("create", "./magisk", dest.data());
+            xsymlink("./magisk", dest.data());
         }
-        create_and_mount("magisk", src);
+    } else if (name() == "magiskpolicy") {
+        string dest = dir_name + "/supolicy";
+        VLOGD("create", "./magiskpolicy", dest.data());
+        xsymlink("./magiskpolicy", dest.data());
     }
-};
-
-static void inject_magisk_bins(root_node *system) {
-    auto bin = system->get_child<inter_node>("bin");
-    if (!bin) {
-        bin = new inter_node("bin");
-        system->insert(bin);
-    }
-
-    // Insert binaries
-    bin->insert(new magisk_node("magisk"));
-    bin->insert(new magisk_node("magiskpolicy"));
-
-    // Also delete all applets to make sure no modules can override it
-    for (int i = 0; applet_names[i]; ++i)
-        delete bin->extract(applet_names[i]);
-    delete bin->extract("supolicy");
+    create_and_mount("magisk", src);
 }
 
 vector<module_info> *module_list;
@@ -280,10 +278,7 @@ void load_modules() {
         system->collect_module_files(module, fd);
         close(fd);
     }
-    if (MAGISKTMP != "/sbin" || !str_contains(getenv("PATH") ?: "", "/sbin")) {
-        // Need to inject our binaries into /system/bin
-        inject_magisk_bins(system);
-    }
+    inject_magisk_bins(system);
 
     if (!system->is_empty()) {
         // Handle special read-only partitions

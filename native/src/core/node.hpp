@@ -49,8 +49,8 @@ public:
 
     virtual void mount() = 0;
 
-    static string module_mnt;
-    static string mirror_dir;
+    inline static string module_mnt;
+    inline static string mirror_dir;
 
 protected:
     template<class T>
@@ -314,3 +314,10 @@ const string &node_entry::node_path() {
         _node_path = _parent->node_path() + '/' + _name;
     return _node_path;
 }
+
+class magisk_node : public node_entry {
+public:
+    explicit magisk_node(const char *name) : node_entry(name, DT_REG, this) {}
+    void mount() override;
+};
+
