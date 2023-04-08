@@ -4,6 +4,7 @@
 #include <regex.h>
 #include <bitset>
 #include <list>
+#include <unwind.h>
 
 #include <lsplt.hpp>
 
@@ -11,10 +12,12 @@
 #include <flags.h>
 #include <daemon.hpp>
 
+#include "magisk.hpp"
 #include "zygisk.hpp"
 #include "memory.hpp"
 #include "module.hpp"
 #include "deny/deny.hpp"
+#include "resetprop.hpp"
 
 using namespace std;
 using jni_hook::hash_map;
@@ -48,6 +51,7 @@ vector<tuple<dev_t, ino_t, const char *, void **>> *plt_hook_list;
 map<string, vector<JNINativeMethod>, StringCmp> *jni_hook_list;
 hash_map<xstring, tree_map<xstring, tree_map<xstring, void *>>> *jni_method_map;
 bool should_unmap_zygisk = false;
+bool is_zygote = false;
 
 // Current context
 HookContext *g_ctx;
@@ -149,16 +153,9 @@ DCL_HOOK_FUNC(int, fork) {
 // Unmount stuffs in the process's private mount namespace
 DCL_HOOK_FUNC(int, unshare, int flags) {
     int res = old_unshare(flags);
-    if (g_ctx && (flags & CLONE_NEWNS) != 0 && res == 0 &&
-        // For some unknown reason, unmounting app_process in SysUI can break.
-        // This is reproducible on the official AVD running API 26 and 27.
-        // Simply avoid doing any unmounts for SysUI to avoid potential issues.
-        (g_ctx->info_flags & PROCESS_IS_SYS_UI) == 0) {
+    if (g_ctx && (flags & CLONE_NEWNS) != 0 && res == 0) {
         if (g_ctx->flags[DO_REVERT_UNMOUNT]) {
             revert_unmount();
-        } else {
-            umount2("/system/bin/app_process64", MNT_DETACH);
-            umount2("/system/bin/app_process32", MNT_DETACH);
         }
         // Restore errno back to 0
         errno = 0;
@@ -205,6 +202,64 @@ DCL_HOOK_FUNC(int, pthread_attr_destroy, void *target) {
     }
 
     return res;
+}
+
+inline void *unwind_get_region_start(_Unwind_Context *ctx) {
+    auto fp = _Unwind_GetRegionStart(ctx);
+#if defined(__arm__)
+    auto pc = _Unwind_GetGR(ctx, 15); // r15 is pc
+    if (pc & 1) {
+        // Thumb mode
+        fp |= 1;
+    }
+#endif
+    return reinterpret_cast<void *>(fp);
+}
+
+void ReloadNativeBridge(const std::string &nb) {
+#if defined(__LP64__)
+    xumount2(("/system/lib64/" + nb).data(), MNT_DETACH);
+#else
+    xumount2(("/system/lib/" + nb).data(), MNT_DETACH);
+#endif
+
+    // Use unwind to find the address of LoadNativeBridge
+    // and call it to load the real native bridge
+    void *load_native_bridge = nullptr;
+    _Unwind_Backtrace(+[](struct _Unwind_Context *ctx, void *arg) -> _Unwind_Reason_Code {
+        void *fp = unwind_get_region_start(ctx);
+        Dl_info info{};
+        dladdr(fp, &info);
+        ZLOGV("backtrace: %p %s\n", fp, info.dli_fname ? info.dli_fname : "???");
+        if (info.dli_fname && std::string_view(info.dli_fname).ends_with("/libart.so")) {
+            ZLOGV("LoadNativeBridge: %p\n", fp);
+            *reinterpret_cast<void **>(arg) = fp;
+            return _URC_END_OF_STACK;
+        }
+        return _URC_NO_REASON;
+    }, &load_native_bridge);
+    reinterpret_cast<bool (*)(const std::string &)>(load_native_bridge)(nb);
+}
+
+// it should be safe to assume all dlclose's in libnativebridge are for zygisk_loader
+DCL_HOOK_FUNC(int, dlclose, void *handle) {
+    static bool kDone = false;
+    if (!kDone) {
+        ZLOGV("dlclose zygisk_loader\n");
+        kDone = true;
+        string nb = getprop(NBPROP);
+        if (nb != ZYGISKLDR) {
+            ReloadNativeBridge(nb);
+        }
+    }
+    if (!is_zygote) {
+        ZLOGI("Not in zygote, exiting\n");
+        unhook_functions();
+        close(logd_fd.exchange(-1));
+        old_dlclose(handle);
+        [[clang::musttail]] return dlclose(self_handle);
+    }
+    [[clang::musttail]] return old_dlclose(handle);
 }
 
 #undef DCL_HOOK_FUNC
@@ -545,19 +600,19 @@ void HookContext::app_specialize_pre() {
     flags[APP_SPECIALIZE] = true;
 
     vector<int> module_fds;
-    int fd = remote_get_info(args.app->uid, process, &info_flags, module_fds);
+    const char *app_data_dir = "";
     if (args.app->app_data_dir) {
-        const auto *app_data_dir = env->GetStringUTFChars(args.app->app_data_dir, nullptr);
-        if (std::string_view(app_data_dir).ends_with("/com.android.systemui")) {
-            info_flags |= PROCESS_IS_SYS_UI;
-        }
-        env->ReleaseStringUTFChars(args.app->app_data_dir, app_data_dir);
+        app_data_dir = env->GetStringUTFChars(args.app->app_data_dir, nullptr);
     }
+    int fd = remote_get_info(args.app->uid, process, app_data_dir, &info_flags, module_fds);
     if ((info_flags & UNMOUNT_MASK) == UNMOUNT_MASK) {
         ZLOGI("[%s] is on the denylist\n", process);
         flags[DO_REVERT_UNMOUNT] = true;
     } else if (fd >= 0) {
         run_modules_pre(module_fds);
+    }
+    if (args.app->app_data_dir) {
+        env->ReleaseStringUTFChars(args.app->app_data_dir, app_data_dir);
     }
     close(fd);
 }
@@ -576,7 +631,7 @@ void HookContext::app_specialize_post() {
 
 void HookContext::server_specialize_pre() {
     vector<int> module_fds;
-    int fd = remote_get_info(1000, "system_server", &info_flags, module_fds);
+    int fd = remote_get_info(1000, "system_server", "", &info_flags, module_fds);
     if (fd >= 0) {
         if (module_fds.empty()) {
             write_int(fd, 0);
@@ -733,26 +788,35 @@ static void hook_commit() {
 #define PLT_HOOK_REGISTER(DEV, INODE, NAME) \
     PLT_HOOK_REGISTER_SYM(DEV, INODE, #NAME, NAME)
 
-void hook_functions() {
+void hook_functions(bool zygote) {
+    is_zygote = zygote;
     default_new(plt_hook_list);
     default_new(jni_hook_list);
     default_new(jni_method_map);
 
     ino_t android_runtime_inode = 0;
     dev_t android_runtime_dev = 0;
+    ino_t native_bridge_inode = 0;
+    dev_t native_bridge_dev = 0;
 
     for (auto &map : lsplt::MapInfo::Scan()) {
-        if (map.path.ends_with("libandroid_runtime.so")) {
+        if (map.path.ends_with("/libandroid_runtime.so")) {
             android_runtime_inode = map.inode;
             android_runtime_dev = map.dev;
-            break;
+        } else if (map.path.ends_with("/libnativebridge.so")) {
+            native_bridge_inode = map.inode;
+            native_bridge_dev = map.dev;
         }
     }
 
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, androidSetCreateThreadFunc);
-    PLT_HOOK_REGISTER_SYM(android_runtime_dev, android_runtime_inode, "__android_log_close", android_log_close);
+    PLT_HOOK_REGISTER(native_bridge_dev, native_bridge_inode, dlclose);
+    if (is_zygote) {
+        PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
+        PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
+        PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, androidSetCreateThreadFunc);
+        PLT_HOOK_REGISTER_SYM(android_runtime_dev, android_runtime_inode, "__android_log_close",
+                              android_log_close);
+    }
     hook_commit();
 
     // Remove unhooked methods

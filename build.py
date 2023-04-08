@@ -325,12 +325,10 @@ def dump_bin_header(args):
             preload = op.join('native', 'out', archs32map[arch], 'libzygisk-ld.so')
             with open(preload, 'rb') as src:
                 text += binary_dump(src, 'zygisk32_ld', compressor=lambda x: x)
-            text += "#define zygisk_ld zygisk64_ld\n"
         else:
             preload = op.join('native', 'out', arch, 'libzygisk-ld.so')
             with open(preload, 'rb') as src:
                 text += binary_dump(src, 'zygisk32_ld', compressor=lambda x: x)
-            text += "#define zygisk_ld zygisk32_ld\n"
         write_if_diff(op.join(native_gen_path, f'{arch}_binaries.h'), text)
 
 

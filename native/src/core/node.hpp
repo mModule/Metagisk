@@ -321,3 +321,9 @@ public:
     void mount() override;
 };
 
+template<bool is64bit>
+class zygisk_node : public magisk_node {
+public:
+    explicit zygisk_node(const char *name) : magisk_node(name) {}
+    void mount() override;
+};
