@@ -4,6 +4,7 @@
 #include <sys/mount.h>
 #include <android/log.h>
 #include <android/dlext.h>
+#include <unwind.h>
 
 #include <base.hpp>
 #include <daemon.hpp>
@@ -18,6 +19,7 @@
 using namespace std;
 
 void *self_handle = nullptr;
+bool is_zygote = false;
 
 extern "C"
 [[maybe_unused]]
@@ -25,20 +27,56 @@ void zygisk_inject_entry(void *handle) {
     self_handle = handle;
     // we need to check if we are running in zygote process
     // if not, we still need to load the original native bridge if exists
-    bool zygote = false;
     if (auto fp = open_file("/proc/self/attr/current", "r")) {
         char buf[16];
         fscanf(fp.get(), "%15s", buf);
-        zygote = (buf == "u:r:zygote:s0"sv && getppid() == 1 && getuid() == 0);
+        is_zygote = (buf == "u:r:zygote:s0"sv && getppid() == 1 && getuid() == 0);
     }
-    if (zygote) {
+    if (is_zygote) {
         zygisk_logging();
+        hook_functions();
     } else {
         android_logging();
     }
     ZLOGD("load success\n");
-    hook_functions(zygote);
 }
+
+static inline void *unwind_get_region_start(_Unwind_Context *ctx) {
+    auto fp = _Unwind_GetRegionStart(ctx);
+#if defined(__arm__)
+    auto pc = _Unwind_GetGR(ctx, 15); // r15 is pc
+    if (pc & 1) {
+        // Thumb mode
+        fp |= 1;
+    }
+#endif
+    return reinterpret_cast<void *>(fp);
+}
+
+extern "C"
+[[maybe_unused]] void unload_first_stage() {
+    ZLOGD("dlclose zygisk_loader\n");
+    auto nb = getprop(NBPROP);
+    // Use unwind to find the address of LoadNativeBridge
+    // and call it to load the real native bridge
+    void *load_native_bridge = nullptr;
+    _Unwind_Backtrace(+[](struct _Unwind_Context *ctx, void *arg) -> _Unwind_Reason_Code {
+        void *fp = unwind_get_region_start(ctx);
+        Dl_info info{};
+        dladdr(fp, &info);
+        ZLOGV("backtrace: %p %s %s\n", fp, info.dli_fname ? info.dli_fname : "???", info.dli_sname ? info.dli_sname : "???");
+        if (info.dli_fname && std::string_view(info.dli_fname).ends_with("/libart.so")) {
+            ZLOGV("LoadNativeBridge: %p\n", fp);
+            *reinterpret_cast<void **>(arg) = fp;
+            return _URC_END_OF_STACK;
+        }
+        return _URC_NO_REASON;
+    }, &load_native_bridge);
+    if (is_zygote || (nb != ZYGISKLDR && nb != "0" && !nb.empty())) {
+        reinterpret_cast<bool (*)(const std::string &)>(load_native_bridge)(nb);
+    }
+}
+
 
 // The following code runs in zygote/app process
 
