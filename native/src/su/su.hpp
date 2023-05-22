@@ -52,7 +52,7 @@ struct su_request : public su_req_base {
     std::string shell = DEFAULT_SHELL;
     std::string command;
     std::string context;
-    std::vector<gid_t> gids;
+    std::vector<gid_t> gids { AID_ROOT };
 };
 
 struct su_context {
