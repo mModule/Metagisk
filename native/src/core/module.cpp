@@ -530,8 +530,8 @@ void reset_zygisk(bool restore) {
     }
     if (restore) {
         string native_bridge_orig = "0";
-        if (native_bridge.length() > strlen(ZYGISKLDR)) {
-            native_bridge_orig = native_bridge.substr(strlen(ZYGISKLDR));
+        if (native_bridge.length() > sizeof(ZYGISKLDR) - 1) {
+            native_bridge_orig = native_bridge.substr(sizeof(ZYGISKLDR) - 1);
         }
         set_prop(NBPROP, native_bridge_orig.data(), true);
     } else {

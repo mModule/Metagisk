@@ -4,7 +4,7 @@
 
 #define JAVA_PACKAGE_NAME "com.topjohnwu.magisk"
 #define LOGFILE         "/cache/magisk.log"
-#define ZYGISKLDR       "libzygisk_loader.so"
+#define ZYGISKLDR       "libzygisk.so"
 #define NBPROP          "ro.dalvik.vm.native.bridge"
 #define SECURE_DIR      "/data/adb"
 #define MODULEROOT      SECURE_DIR "/modules"
