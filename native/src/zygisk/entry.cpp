@@ -18,7 +18,7 @@ void *self_handle = nullptr;
 
 extern "C" [[maybe_unused]] void zygisk_inject_entry(void *handle) {
     self_handle = handle;
-    zygisk_logging();
+    rust::zygisk_entry();
     hook_functions();
     ZLOGD("load success\n");
 }

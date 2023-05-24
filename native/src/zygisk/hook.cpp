@@ -21,13 +21,13 @@ using rust::MagiskD;
 using rust::get_magiskd;
 
 // Extreme verbose logging
-//#define ZLOGV(...) ZLOGD(__VA_ARGS__)
-#define ZLOGV(...) (void*)0
+#define ZLOGV(...) ZLOGD(__VA_ARGS__)
+//#define ZLOGV(...) (void*)0
 
 static void hook_unloader();
 static void unhook_functions();
 static void hook_zygote();
-static void ReloadNativeBridge(const string &nb);
+static void reload_native_bridge(const string &nb);
 
 namespace {
 
@@ -195,20 +195,9 @@ DCL_HOOK_FUNC(int, dlclose, void *handle) {
     if (!kDone) {
         ZLOGV("dlclose zygisk_loader\n");
         kDone = true;
-        ReloadNativeBridge(get_prop(NBPROP));
+        reload_native_bridge(get_prop(NBPROP));
     }
     [[clang::musttail]] return old_dlclose(handle);
-}
-
-DCL_HOOK_FUNC(bool, LoadNativeBridge, const char* nb_library_filename,
-              const android::NativeBridgeRuntimeCallbacks* runtime_cbs) {
-    ZLOGD("LoadNativeBridge: %s with cbs: %p\n", nb_library_filename, runtime_cbs);
-    runtime_callbacks = runtime_cbs;
-    auto len = strlen(ZYGISKLDR);
-    if (strlen(nb_library_filename) > len) {
-        return old_LoadNativeBridge(nb_library_filename + len, runtime_cbs);
-    }
-    return false;
 }
 
 DCL_HOOK_FUNC(char *, strdup, const char *s) {
@@ -736,23 +725,74 @@ inline void *unwind_get_region_start(_Unwind_Context *ctx) {
     return reinterpret_cast<void *>(fp);
 }
 
-static void ReloadNativeBridge(const string &nb) {
+static uintptr_t find_value_in_range(struct _Unwind_Context *ctx, const uintptr_t start, const uintptr_t end) {
+#if defined(__aarch64__)
+    for (int i = 19; i <= 28; ++i) {
+        auto val = static_cast<uintptr_t>(_Unwind_GetGR(ctx, i));
+        ZLOGV("r%d = %p; start=%p, end=%p\n", i, reinterpret_cast<void *>(val), reinterpret_cast<void *>(start), reinterpret_cast<void *>(end));
+        if (val >= start && val < end)
+            return val;
+    }
+#elif defined(__arm__)
+    for (int i = 4; i <= 10; ++i) {
+        auto val = static_cast<uintptr_t>(_Unwind_GetGR(ctx, i));
+        ZLOGV("r%d = %p; start=%p, end=%p\n", i, reinterpret_cast<void *>(val), reinterpret_cast<void *>(start), reinterpret_cast<void *>(end));
+        if (val >= start && val < end)
+            return val;
+    }
+#elif defined(__i386__)
+    auto ebp = static_cast<uintptr_t>(_Unwind_GetGR(ctx, 5));
+    // get 2nd arg from stack
+    auto val = *reinterpret_cast<uintptr_t *>(ebp + 3 * sizeof(void *));
+    ZLOGV("arg = %p; start=%p, end=%p\n", reinterpret_cast<void *>(val), reinterpret_cast<void *>(start), reinterpret_cast<void *>(end));
+    if (val >= start && val < end)
+        return val;
+#elif defined(__x86_64__)
+    for (int i = 15; i >= 12; --i) {
+        auto val = static_cast<uintptr_t>(_Unwind_GetGR(ctx, i));
+        ZLOGV("r%d = %p; start=%p, end=%p\n", i, reinterpret_cast<void *>(val), reinterpret_cast<void *>(start), reinterpret_cast<void *>(end));
+        if (val >= start && val < end)
+            return val;
+    }
+#else
+#error "Unsupported architecture"
+#endif
+    return 0;
+}
+
+static void reload_native_bridge(const string &nb) {
+    static uintptr_t libart_rw_start = 0;
+    static uintptr_t libart_rw_end = 0;
+
+    for (const auto &map : lsplt::MapInfo::Scan()) {
+         if (map.path.ends_with("/libart.so") && map.perms == (PROT_WRITE | PROT_READ)) {
+            libart_rw_start = map.start;
+            libart_rw_end = map.end;
+            ZLOGV("libart.so: start=%p, end=%p\n", reinterpret_cast<void *>(libart_rw_start), reinterpret_cast<void *>(libart_rw_end));
+            break;
+        }
+    }
+
     // Use unwind to find the address of LoadNativeBridge
-    // and call it to get NativeBridgeRuntimeCallbacks
-    void *load_native_bridge = nullptr;
+    bool (*load_native_bridge)(const char *nb_library_filename,
+            const android::NativeBridgeRuntimeCallbacks *runtime_cbs) = nullptr;
     _Unwind_Backtrace(+[](struct _Unwind_Context *ctx, void *arg) -> _Unwind_Reason_Code {
         void *fp = unwind_get_region_start(ctx);
         Dl_info info{};
         dladdr(fp, &info);
         ZLOGV("backtrace: %p %s\n", fp, info.dli_fname ? info.dli_fname : "???");
-        if (info.dli_fname && std::string_view(info.dli_fname).ends_with("/libart.so")) {
-            ZLOGV("LoadNativeBridge: %p\n", fp);
+        if (info.dli_fname && std::string_view(info.dli_fname).ends_with("/libnativebridge.so")) {
             *reinterpret_cast<void **>(arg) = fp;
+            runtime_callbacks = reinterpret_cast<decltype(runtime_callbacks)>(find_value_in_range(ctx, libart_rw_start, libart_rw_end));
+            ZLOGD("cbs: %p\n", runtime_callbacks);
             return _URC_END_OF_STACK;
         }
         return _URC_NO_REASON;
     }, &load_native_bridge);
-    reinterpret_cast<bool (*)(const string &)>(load_native_bridge)(nb);
+    constexpr auto len = sizeof(ZYGISKLDR) - 1;
+    if (nb.size() > len) {
+        load_native_bridge(nb.data() + len, runtime_callbacks);
+    }
 }
 
 static void hook_register(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func) {
@@ -783,8 +823,6 @@ void hook_functions() {
     dev_t android_runtime_dev = 0;
     ino_t native_bridge_inode = 0;
     dev_t native_bridge_dev = 0;
-    ino_t art_inode = 0;
-    dev_t art_dev = 0;
 
     for (auto &map : lsplt::MapInfo::Scan()) {
         if (map.path.ends_with("/libandroid_runtime.so")) {
@@ -793,9 +831,6 @@ void hook_functions() {
         } else if (map.path.ends_with("/libnativebridge.so")) {
             native_bridge_inode = map.inode;
             native_bridge_dev = map.dev;
-        } else if (map.path.ends_with("/libart.so")) {
-            art_inode = map.inode;
-            art_dev = map.dev;
         }
     }
 
@@ -803,8 +838,6 @@ void hook_functions() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
-    PLT_HOOK_REGISTER(art_dev, art_inode, LoadNativeBridge);
-    PLT_HOOK_REGISTER_SYM(art_dev, art_inode, "_ZN7android16LoadNativeBridgeEPKcPKNS_28NativeBridgeRuntimeCallbacksE", LoadNativeBridge);
     PLT_HOOK_REGISTER_SYM(android_runtime_dev, android_runtime_inode, "__android_log_close", android_log_close);
     hook_commit();
 
